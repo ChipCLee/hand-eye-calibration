@@ -5,13 +5,14 @@
 1. Scope and assumptions  
 2. Frames, notation, and data formats  
 3. Phase 1 – System setup  
-## 4. Phase 2 – Data collection  
-## 5. Phase 3 – Calibration computation (AX = XB)  
-## 6. Phase 4 – Validation  
-## 7. Phase 5 – Deployment  
-## 8. Good pose sampling and numerical conditioning  
-## 9. Using existing toolboxes vs. implementing from scratch  
-## 10. Summary of key input and output documents  
+4. Phase 2 – Data collection  
+5. Phase 3 – Calibration computation (AX = XB)  
+6. Phase 4 – Validation  
+7. Phase 5 – Deployment  
+8. Good pose sampling and numerical conditioning  
+9. Using existing toolboxes vs. implementing from scratch  
+10. Summary of key input and output documents  
+11. Execution ownership: manual vs AI-agent work  
 
 ---
 
@@ -22,10 +23,10 @@ Calibrate the rigid transform between the Franka end‑effector frame `e` and an
 
 **Assumptions:**
 
-- **Robot:** Franka Emika Panda or FR3  
+- **Robot:** Franka FR3  
   - Base frame: `r` (robot base, e.g. `panda_link0` / `fr3_link0`)  
   - End‑effector frame: `e` (flange or tool frame, e.g. `panda_link8` / `fr3_link8`)
-- **Camera:** Intel RealSense D435 rigidly mounted on the end‑effector  
+- **Camera:** Intel RealSense D435i rigidly mounted on the end‑effector  
   - Camera frame: `c` (e.g. `camera_color_optical_frame`)
 - **Target:** Planar calibration target (chessboard or Charuco board) rigidly fixed in the workspace  
   - Target frame: `o` (object/board frame)
@@ -65,6 +66,8 @@ R_{ab} & t_{ab} \\
 - **End‑effector → camera (unknown):** \( {}^eT_c \) (denoted `eMc`)
 
 ### 2.3 Data formats
+
+> **Quaternion ordering — silent-corruption warning.** All quaternions in this plan use `[qx, qy, qz, qw]` (xyzw), matching ROS / `tf2` / OpenCV. Several common libraries default to a different order: SciPy `Rotation.from_quat`/`as_quat` uses xyzw (matches), but Eigen `Quaterniond(w,x,y,z)` and many message conversions use **wxyz**. Mixing orders does not raise an error — it silently rotates the result. Every conversion in this pipeline must explicitly assert the ordering, and a single helper module should own all quaternion ↔ matrix conversions.
 
 #### Robot poses `rMe`
 
@@ -135,7 +138,7 @@ Fix the calibration target rigidly in the workspace.
 
 Franka robot installed and controllable via ROS 2.
 
-RealSense D435 mounted rigidly on the end‑effector.
+RealSense D435i mounted rigidly on the end‑effector.
 
 Calibration target printed and measured.
 
@@ -179,7 +182,7 @@ Step 1.2 – Mount camera and measure approximate transform
 
 Action:
 
-Rigidly mount D435 to the end‑effector.
+Rigidly mount D435i to the end‑effector.
 
 Measure approximate translation and orientation from e to c.
 
@@ -289,6 +292,8 @@ Board fixed and visible from multiple robot poses.
 
 Camera intrinsics known.
 
+Camera auto-exposure and auto-white-balance locked (fixed exposure/gain) for the whole capture session, so corner detection stays stable across poses and the intrinsics remain valid. The robot must be fully stationary at each capture (settling delay after motion) to avoid motion blur and TF/image desync.
+
 ### 4.3 Pose sampling guidelines
 
 Number of poses:
@@ -378,7 +383,9 @@ Chessboard: findChessboardCorners + solvePnP.
 
 Charuco: detectMarkers + interpolateCornersCharuco + estimatePoseCharucoBoard.
 
-For planar targets, use a planar-aware PnP method when available, refine the pose, require enough detected corners, and reject poses with negative depth or obvious board-pose flips.
+**OpenCV ArUco API version — pin and branch.** The function names above are the pre-4.7 ArUco API. OpenCV ≥ 4.7 replaced them with the `cv2.aruco.CharucoDetector` class (`detectBoard()` returns ChArUco corners/ids plus marker detections), and `cv2.aruco.ArucoDetector` for raw markers; the standalone `interpolateCornersCharuco` / `estimatePoseCharucoBoard` functions are deprecated and removed in 4.9+. Pin the OpenCV version in the environment and write the detection code against the matching API (prefer the ≥ 4.7 `CharucoDetector` path for new code). For ChArUco pose, recover board pose with `solvePnP` on the interpolated ChArUco corners + their 3D board coordinates.
+
+For planar targets, use a planar-aware PnP method (`cv2.SOLVEPNP_IPPE` / `SOLVEPNP_IPPE_SQUARE` for square fiducials) when available, refine the pose, require enough detected corners, and reject poses with negative depth or obvious board-pose flips.
 
 Convert pose to homogeneous matrix and store.
 
@@ -444,6 +451,8 @@ Too few Charuco/chessboard corners are detected for a well-constrained pose.
 PnP returns negative depth, an obvious planar pose flip, or an implausible board distance.
 
 Reprojection error > threshold (e.g. > 0.5–1.0 pixels).
+
+**Motion-pair consistency screen (`A`/`B` rotation angle).** For each motion pair, the rotation angle of `A_ij = inv(rMe_j)·rMe_i` must equal the rotation angle of `B_ij = cMo_j·inv(cMo_i)` (they are conjugate, so `angle(A_ij) ≈ angle(B_ij)`). Flag/reject pairs whose angles disagree beyond a small tolerance (e.g. > 1–2°) — disagreement reveals bad time sync, a board-pose flip, or wrong pairing, and is a stronger filter than reprojection error alone. Also screen out motion pairs with near-zero rotation (uninformative, ill-conditioned).
 
 Visualize detected corners and pose axes on image.
 
@@ -535,6 +544,8 @@ R_target2cam, t_target2cam
 
 Choose method: cv2.CALIB_HAND_EYE_TSAI, PARK, DANIILIDIS, etc.
 
+Recommended: run all available methods (TSAI, PARK, HORAUD, ANDREFF, DANIILIDIS), compute the residuals from Step 3.4 for each, and select the `eMc` with the lowest residual rather than picking a single method blindly. Large disagreement between methods is itself a red flag for ill-conditioned or noisy data.
+
 Input:
 
 Arrays from Step 3.1.
@@ -588,6 +599,8 @@ Compute residual errors:
 For relative-motion residuals, compare `A_ij * eMc` against `eMc * B_ij` for pose pairs.
 
 For absolute consistency, compute `rMo_est = rMe * eMc * cMo` for each sample and report how tightly the fixed board pose clusters in the robot base frame.
+
+Gross-error gate: compare the solved `eMc` against the tape-measure `eMc_approx.yaml` from Step 1.2. The translation should agree within a few centimeters and the orientation within a few tens of degrees; a large discrepancy signals a convention/sign error or bad data, not just imprecision.
 
 Report:
 
@@ -659,7 +672,7 @@ Get rMe from TF at the validation image timestamp.
 
 Compute rMc = rMe * eMc.
 
-If rMo (board pose in base) known, compute:
+Obtain rMo (board pose in base). Note `rMo` is not independently measured — estimate it from the **calibration** poses as the average/robust mean of `rMo_est = rMe * eMc * cMo` (Step 3.4), then validate on the **held-out** poses only. Do not estimate `rMo` from the same held-out sample you are validating, or the check becomes circular. Then compute:
 
 cMo_pred = (rMc)^(-1) * rMo.
 
@@ -743,7 +756,7 @@ Output:
 
 franka_handeye_config.yaml
 robot: franka_panda
-camera: realsense_d435
+camera: realsense_d435i
 frames:
   base: panda_link0
   ee: panda_link8
@@ -795,6 +808,8 @@ calibration_runs/run_YYYYMMDD/
 ## 8. Good pose sampling and numerical conditioning
 
 ### 8.1 Key principles
+
+**Hard requirement — at least two non-parallel rotation axes.** Hand-eye `AX = XB` only becomes well-posed when the relative motions rotate about **at least two linearly independent axes**. If every motion rotates about (nearly) the same axis — or the dataset is dominated by pure translations — the translation part of `eMc` is unobservable and the solver returns a plausible-looking but garbage translation. Ensure the captured poses include rotations about clearly different axes; this is a correctness prerequisite, not just a quality preference.
 
 Diverse orientations:
 
@@ -947,4 +962,61 @@ franka_camera.launch.py
 handeye_maintenance_guide.md
 
 
-You can now save this directly as `plan.md` in your project.
+## 11. Execution ownership: manual vs AI-agent work
+
+This section separates work that requires a developer/operator with access to the physical robot setup from work that can be generated, implemented, or executed by AI agents once the required inputs are available.
+
+### 11.1 Manual / developer-operator dependent steps
+
+These steps require physical access, hardware decisions, safety approval, or live ROS/robot operation. An AI agent can prepare templates, scripts, and checklists, but a developer/operator must perform or approve the physical action.
+
+| Plan step | Manual dependency | AI-agent support |
+| --- | --- | --- |
+| Step 1.1 – Define frame naming conventions | Confirm the actual deployed robot, end-effector, camera, and target frame names from the live URDF/TF tree. | Draft `frames.md`, inspect provided URDF/TF dumps, and flag inconsistent frame choices. |
+| Step 1.2 – Mount camera and measure approximate transform | Physically mount the D435i, verify rigidity, measure approximate translation/orientation, and confirm no cable strain or collisions. | Generate `eMc_approx.yaml` template and sanity-check measurements against expected camera placement. |
+| Step 1.3 – Install and verify ROS 2 stacks | Install packages in the robot environment, launch drivers, connect to hardware, and verify live ROS topics and TF. | Generate install commands, launch snippets, topic-check scripts, and `system_check.md` format. |
+| Step 1.4 – Camera intrinsic calibration | Decide whether factory intrinsics are acceptable; if recalibrating, physically collect calibration images. | Process saved calibration images, generate `camera_intrinsics.yaml`, and validate reprojection error. |
+| Step 1.5 – Fix and document calibration target | Print or procure the target, measure square/marker sizes with a ruler/caliper, and rigidly attach the board in the workspace. | Generate `board_config.yaml`, target-printing specs, and measurement checklist. |
+| Section 4.3 – Pose sampling guidelines | Choose reachable, collision-free robot poses with good board visibility and enough orientation diversity. | Analyze proposed or collected poses for coverage, baselines, and conditioning. |
+| Step 2.2 – Robot pose acquisition | Move the robot manually or approve/run scripted motions under normal robot safety procedures. | Generate pose-capture logic and optionally propose a pose list, but not autonomously move hardware without operator control. |
+| Step 2.3 – Image capture on live hardware | Ensure lighting, board visibility, robot stability, and successful live image acquisition. | Run board detection on captured images, estimate `cMo`, and reject poor samples. |
+| Step 4.1 – TF integration for validation | Launch TF in the live ROS graph and confirm it does not conflict with existing RealSense TF publishers. | Generate launch files and detect likely duplicate TF edges from logs or TF dumps. |
+| Step 4.4 – Application-level sanity test | Command or approve robot motion for physical alignment checks and record observed offsets. | Generate the test procedure, scripts, and `application_test_notes.md` template. |
+| Step 5.2 – Production ROS/URDF deployment | Approve the final deployment path, run it in the robot stack, and perform safety/regression checks. | Generate launch/URDF/Xacro/config changes and explain deployment tradeoffs. |
+| Step 5.3 – Recalibration policy approval | Decide operational triggers such as remount, collision, maintenance, or accuracy drift. | Draft `handeye_maintenance_guide.md` and archive layout. |
+
+### 11.2 AI-agent executable or generatable steps
+
+These steps can be generated and, when data/files are available in the workspace, performed directly by AI agents without physical hardware intervention.
+
+| Plan step | AI-agent work product | Required inputs |
+| --- | --- | --- |
+| Section 2 – Data formats | YAML schemas, transform conversion helpers, quaternion/matrix validation utilities. | Agreed frame names and conventions. |
+| Step 1.1 support | `frames.md` draft and consistency checks. | URDF/TF dump or developer-confirmed frame names. |
+| Step 1.2 support | `eMc_approx.yaml` template and sanity-check report. | Manual measurements. |
+| Step 1.3 support | ROS topic/TF verification script and `system_check.md` template. | ROS package names and launch commands. |
+| Step 1.4 processing | Intrinsic calibration processing and `camera_intrinsics.yaml`. | Calibration image set or ROS camera calibration output. |
+| Step 1.5 support | `board_config.yaml` and target metadata validation. | Board type, dimensions, and marker dictionary. |
+| Step 2.1 – Capture node/script | `capture_node.py` or C++ node, launch/config files, and usage documentation. | Frame names, topic names, intrinsics, board config. |
+| Step 2.3 processing | Board detection, PnP/Charuco pose estimation, raw image overlays, and per-sample `cMo` files. | Captured images and camera intrinsics. |
+| Step 2.4 – Synchronization/indexing | `paired_poses.yaml`, `sample_metadata.yaml`, timestamp matching, and consistency checks. | Pose/image files and timestamps. |
+| Step 2.5 – Data quality checks | `data_quality_report.md`, reprojection statistics, outlier list, and held-out validation split. | Captured samples and detection results. |
+| Step 3.1 – Data loading/conversion | `compute_handeye.py`, transform parsing, and `calib_input_debug.npz`. | Valid paired `rMe` and `cMo` files. |
+| Step 3.2 – Solver execution | OpenCV hand-eye solve across selected methods and candidate `eMc.yaml` results. | `calib_input_debug.npz` or parsed pose arrays. |
+| Step 3.3 – Convention sanity check | Synthetic hand-eye test and `synthetic_handeye_test_report.md`. | Agreed convention and solver implementation. |
+| Step 3.4 – Residuals | `calibration_report.md`, relative-motion residuals, `rMo_est` clustering, and outlier analysis. | Candidate `eMc`, paired poses, board config. |
+| Step 4.1 support | `static_transform_e_to_c.launch.py` or equivalent ROS launch/config snippet. | Final `eMc.yaml` and deployment frame decision. |
+| Step 4.2 – Projection validation | Overlay images and `validation_metrics.yaml`. | Held-out images, `rMe`, `eMc`, board geometry, intrinsics. |
+| Step 4.3 – Consistency validation | `board_pose_consistency.md`. | Multiple valid `rMe`, `eMc`, and `cMo` samples. |
+| Step 5.1 – Central config | `franka_handeye_config.yaml`. | Accepted `eMc`, robot/camera identifiers, date, notes. |
+| Step 5.2 support | ROS launch file, URDF/Xacro fixed-joint edit, and config wiring. | Existing ROS package/URDF files and deployment choice. |
+| Step 5.3 documentation | `handeye_maintenance_guide.md` and `calibration_runs/run_YYYYMMDD/` archive structure. | Accepted calibration artifacts and developer-approved policy. |
+
+### 11.3 Recommended handoff sequence
+
+1. Developer/operator completes physical setup: mount camera, fix target, confirm frames, launch robot/camera stack.
+2. AI agent generates capture, calibration, validation, and reporting scripts from the confirmed config.
+3. Developer/operator collects live pose/image samples using the generated tooling.
+4. AI agent computes calibration, runs synthetic and residual checks, and produces reports.
+5. Developer/operator performs physical validation and approves deployment.
+6. AI agent generates final config, launch/URDF integration, and maintenance documentation.
